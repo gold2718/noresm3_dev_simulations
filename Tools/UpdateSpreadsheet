@@ -1,0 +1,540 @@
+#! /bin/env python3
+
+import argparse
+import ast
+import getpass
+import github   # pip install PyGithub
+import openpyxl # pip install OpenPyxl
+import os
+import re
+import sys
+
+"""
+openpyxl documentation: https://openpyxl.readthedocs.io
+GitHub REST API: https://docs.github.com/en/rest?api
+pygithub documentation: https://pygithub.readthedocs.io/en/stable/introduction.html
+"""
+
+_EXP_SHEET="Experiments"
+_SHEET_FONT_SIZE=10
+
+## Array of columns to fill
+"""
+Experiment ID
+Compset
+Resolution
+Start year
+End year
+High freq output years (#)
+Coupler history output (start / end)?
+Initial / branch / hybrid
+ref case start year for hybrid
+"""
+_COMPSET_TIMES = ['1850', '2000', '2010', 'hist']
+
+_EXPERIMENT_COLUMNS = {"Issue_id":None, "Compset":None, "Resolution":None,
+                       "Originator":None, "Start year":None,
+                       "End year":None, "Model tag":None, "Computer":None,
+                       "Exp. Type":None, "Refcase":None, "Refdate":None}
+_COLUMN_WIDTHS = {"Issue_id":"10", "Compset":"15", "Resolution":"20",
+                  "Originator":"20", "Start year":"15",
+                  "End year":"15", "Model tag":"20", "Computer":"13",
+                  "Exp. Type":"15", "Refcase":"20", "Refdate":"15"}
+_COL_PREF_ORDER = ["Issue_id", "Compset", "Resolution", "Originator",
+                   "Start year", "End year", "Model tag", "Exp. Type",
+                   "Refcase", "Refdate"]
+
+_BDICT_REGEXES = {}
+_BDICT_REGEXES["Start year"] = re.compile(r"[*]*Start year[:][* ]*(.*[^ ])[ ]*$")
+_BDICT_REGEXES["End year"] = re.compile(r"[*]*End year[:][* ]*(.*[^ ])[ ]*$")
+_BDICT_REGEXES["Computer"] = re.compile(r"--mach(ine)?[ ]*([A-Za-z0-9_]+)")
+_BDICT_REGEXES["Exp. Type"] = re.compile(r"xmlchange[ ]*RUN_TYPE=(.*)")
+_BDICT_REGEXES["Refcase"] = re.compile(r"xmlchange[ ]*RUN_REFCASE=(.*)")
+_BDICT_REGEXES["Refdate"] = re.compile(r"xmlchange[ ]*RUN_REFDATE=(.*)")
+_BDICT_REGEXES["STOP_OPTION"] = re.compile(r"xmlchange[ ]*STOP_OPTION=(.*)")
+_BDICT_REGEXES["STOP_N"] = re.compile(r"xmlchange[ ]*STOP_N=(.*)")
+_BDICT_REGEXES["RESUBMIT"] = re.compile(r"xmlchange[ ]*RESUBMIT=(.*)")
+
+def get_password(prompt=None):
+    """
+    Query the user (command line) for a password
+    :param prompt: Optionally provide a prompt for the type of password
+    :return: entered password or None on error
+    """
+    return getpass.getpass(prompt=prompt)
+
+def is_exp_issue(title):
+    """
+    Given an issue title, try to determine if it looks like an experiment issue.
+    """
+    istitle = False
+    title = title.lower()
+    if isinstance(title, str):
+        if (title[0:2] == 'nf') and (title[2:6] in _COMPSET_TIMES):
+            istitle = True
+        elif (title[0:1] == 'n') and (title[1:5] in _COMPSET_TIMES):
+            istitle = True
+        # end if
+    # end if
+    return istitle
+
+def find_github_line_end(line, line_start, line_len):
+    """
+    Find and return the 'end' of a GitHub issues body line
+       beginning at <line_start>.
+    GitHub seems to use a line-feed character instead of a newline, at
+       least in markdown mode.
+    """
+    lf = chr(10) # line feed
+    cr = chr(13) # carriage return
+    line_end = -1
+    while line_end < 0:
+        if (line[line_start] == lf) or (line[line_start] == cr):
+            line_end = line_start
+        else:
+            line_start += 1
+            if line_start >= line_len:
+                line_end = line_len
+            # end if
+        # end if
+    # end while
+    return line_end
+
+def find_body_info(body_text, body_dict):
+    """
+    Search <body_text> for items in <body_dict>.
+    If found, the appropriate key in <body_dict> is updated
+    Leading and trailing whitespace is disregarded.
+    """
+
+    bvalue = None
+    line_start = 0
+    line_end = 0
+    line_len = len(body_text)
+    while line_end < line_len:
+        line_end = find_github_line_end(body_text, line_start, line_len)
+        line = body_text[line_start:line_end]
+        for key in _BDICT_REGEXES.keys():
+            match = _BDICT_REGEXES[key].search(line.strip())
+            if match:
+                bvalue = match.group(len(match.groups()))
+                body_dict[key] = bvalue
+                exit
+            # end if
+        # end if
+        line_start = line_end + 1
+        line_end = line_start
+    # end for
+
+def download_github_issues(repo_name, PAT=None, issues_path=None,
+                           repo_site="api.github.com/repos", user=None,
+                           org="NorESMhub", protocol="https"):
+    """
+    Download all issues from a GitHub repository
+    :param repo_name: the name of the repository (e.g., 'NorESM').
+    :param token: a GitHub Personal Access Token (create on GitHub.com)
+    :param issues_path: a destination filename for the repository's issues
+                        (if provided)
+    :param repo_site: Web location of repository
+    :param user: Owner of 'PAT' (for accessing repository
+    :param org: Organization or user within repository site
+    :param protocol: protocol for reading repository (https or ssh)
+    :return: Issues dictionary on success, None otherwise
+    Inspired by https://stackoverflow.com/questions/57211865/downloading-issues-from-a-public-github-repository#57213375
+    """
+    assert isinstance(repo_name, str), "repository name must be a string"
+    if not user:
+        user = input("Enter the username for this access request: ").strip()
+        assert isinstance(user, str), f"username must be a string, not {type(user)}"
+    # end if
+    if not PAT:
+        PAT = get_password(f"Enter the access token for {repo_name}: ")
+        assert isinstance(PAT, str), "access token must be a string"
+    # end if
+    if protocol == "https":
+        repo_url = f"https://{repo_site}/{org}/{repo_name}"
+    elif protocol == "ssh":
+        repo_url = f"git@{repo_site}:{org}/{repo_name}"
+    else:
+        raise ValueError(f"Invalid protocol ({protocol}), enter https or ssh")
+    # end if
+    auth = github.Auth.Login(login=user, password=PAT)
+    gh_access = github.Github(auth=auth)
+    gh_org = gh_access.get_organization(org)
+    repo = gh_org.get_repo(repo_name)
+    issue_dict = {}
+    issues = repo.get_issues(state="all")
+    for issue in issues:
+        number = None
+        title = None
+        compset = None
+        code_vers = None
+        start_year = None
+        end_year = None
+        body_dict = {"Start year":None, "End year":None, "Computer":None,
+                     "Exp. Type":None, "Refcase":None, "Refdate":None}
+        if isinstance(issue._pull_request, github.GithubObject._NotSetType):
+            title = issue.title
+            number = issue.number
+            body = issue.body
+            find_body_info(body, body_dict)
+            user = issue.user.login
+            args = title.split('.')
+            if len(args) == 5:
+                compset, grid, code_vers, info, date = args
+            elif is_exp_issue(title):
+                print(f"The title for issue {number} is not properly formatted")
+            # end if (no else, just ignore non-experiment issues)
+        # end if (no else, just ignore pull requests)
+        if number and title and compset:
+            if not start_year:
+                period = compset[-4:]
+                if period.lower() == 'hist':
+                    start_year = 1850
+                else:
+                    try:
+                        iyear = int(period)
+                        start_year = 1
+                    except ValueError as verr:
+                        pass # We did not find a start year
+                    # end try
+                # end if
+                body_dict["Start year"] = start_year
+            # end if
+            if start_year and (not end_year):
+                nyears = None
+                if ("STOP_OPTION" in body_dict) and ("STOP_N" in body_dict):
+                    if "year" in body_dict["STOP_OPTION"]:
+                        try:
+                            nyears = int(body_dict["STOP_N"])
+                        except ValueError as verr:
+                            eval = body_dict["STOP_N"]
+                            emsg = f"Invalid STOP_N, {eval}, in issue {number}"
+                            raise ValueError(emsg) from verr
+                        # end if
+                    elif "month" in body_dict["STOP_OPTION"]:
+                        try:
+                            nyears = int(body_dict["STOP_N"]) / 12
+                        except ValueError as verr:
+                            eval = body_dict["STOP_N"]
+                            emsg = f"Invalid STOP_N, {eval}, in issue {number}"
+                            raise ValueError(emsg) from verr
+                        # end try
+                    else:
+                        nyears = 0
+                    # end if
+                    if "RESUBMIT" in body_dict:
+                        try:
+                            nresub = int(body_dict["RESUBMIT"])
+                            nyears = nyears * nresub
+                        except ValueError as verr:
+                            eval = body_dict["RESUBMIT"]
+                            emsg = f"Invalid RESUBMIT, {eval}, in issue {number}"
+                            raise ValueError(emsg) from verr
+                        # end try
+                    # end if
+                    end_year = start_year + nyears
+                    body_dict["End year"] = end_year
+                # end if
+            # end if
+            # Clean up body_dict
+            exp_keys = list(_EXPERIMENT_COLUMNS.keys())
+            remove_keys = []
+            for key in body_dict.keys():
+                if key not in exp_keys:
+                    remove_keys.append(key)
+                # end if
+            # end for
+            for key in remove_keys:
+                del body_dict[key]
+            # end for
+
+            issue_dict[number] = {"Issue_id":number, "Compset":compset,
+                                  "Resolution":grid, "Model tag":code_vers,
+                                  "Originator":user}
+            issue_dict[number].update(body_dict)
+        # end if
+    # end for
+    return issue_dict
+
+def parse_command_line(args):
+    """
+    Parse the command line arguments.
+    :param args: command line argument array
+    :return: multiple arguments.
+    """
+    ap_format = argparse.RawTextHelpFormatter
+    description="""Download and parse issues from a NorESM GitHub simulations
+    repository and use the information to update an Excel spreadsheet.
+    """
+    ss_help = """Path to a Excel spreadsheet to create or modify.
+    If the file does not exist, create a new spreadsheet to fill.
+    If the file does exist, modify / update its contents with information from
+    the issues repository or overwrite the whole file if the --overwrite
+    flag is used."""
+    ow_help = """Force a new spreadsheet to be created, even if the
+    destination file already exists."""
+    parser = argparse.ArgumentParser(description=description,
+                                     formatter_class=ap_format)
+    parser.add_argument("repository", metavar='<NorESM GitHub repository name>',
+                        type=str,
+                        help="Name of a NorESMhub GitHub simulation repository")
+    parser.add_argument("spreadsheet", metavar='<path to Excel spreadsheet>',
+                        type=str,
+                        help=ss_help)
+    parser.add_argument("--overwrite", action='store_true', help=ow_help)
+    pargs = parser.parse_args(args)
+    return pargs.repository, pargs.spreadsheet, pargs.overwrite
+
+def _cell_str(row, col):
+    """Given a row and column, return a column designation"""
+    pass
+
+def find_row(sheet, search_txt, min_row=None, min_col=None, max_col=None,
+             blank_ok=True):
+    """Given some text, search a column or columns for the
+    first matching row.
+    If blank_ok is True, return the first blank row if no matching row found.
+    """
+    assert isinstance(search_txt, str), "search_txt must be a string"
+    search_row = None
+    blank_row = None
+    if min_row:
+        row = min_row
+    else:
+        row = 1
+    # end if
+    if not min_col:
+        min_col = 1
+    # end if
+    if not max_col:
+        max_col = sheet.max_column
+    # end if
+    while (not search_row) and (row <= sheet.max_row):
+        col = 1
+        is_blank_row = True
+        while col <= max_col:
+            cell_val = str(sheet.cell(row=row, column=col).value)
+            if cell_val == search_txt:
+                search_row = row
+                break
+            elif cell_val:
+                is_blank_row = False
+            # end if
+            col += 1
+        # end while
+        if is_blank_row and blank_ok and (blank_row is None):
+            blank_row = row
+        # end if
+        row += 1
+    # end while
+    if (not search_row) and blank_ok:
+        search_row = blank_row
+    # end if
+    return search_row
+
+def set_cell(sheet, row, col, cell_text, alignment=None,
+             fill=None, font=None, width=None, height=None):
+    """
+    Fill out and format a cell.
+    """
+    cell = sheet.cell(row=row, column=col)
+    # Fixed border
+    color = openpyxl.styles.colors.Color(rgb="000000")
+    side = openpyxl.styles.borders.Side(color=color, border_style="thin")
+    border = openpyxl.styles.borders.Border(left=side, right=side,
+                                            bottom=side, top=side)
+    cell.value = cell_text
+    if alignment:
+        cell.alignment = alignment
+    # end if
+    if font:
+        cell.font = font
+    # end if
+    if fill:
+        cell.fill = fill
+    # end if
+    if width:
+        col_name = chr(ord('A') + col - 1)
+        sheet.column_dimensions[col_name].width = width
+    # end if
+    if height:
+        sheet.row_dimensions[row].height = height
+    # end if
+    # Restore the cell's border
+    cell.border = border
+
+def initialize_experiment_sheet(sheet):
+    """
+    Initialize a new spreadsheet by clearing any data and
+    writing and formatting header fields.
+    Return the title row number, first column number and last column number.
+    """
+    row = 1
+    col = 1
+    first_col = 1
+    last_col = -1
+    title_col = -1
+    # Some sheet style information
+    hcenter_align = openpyxl.styles.Alignment(horizontal="center")
+    center_align = openpyxl.styles.Alignment(horizontal="center",
+                                             vertical="center")
+    title_font = openpyxl.styles.Font(size=str(_SHEET_FONT_SIZE + 6), bold=True)
+    headers_font = openpyxl.styles.Font(size=str(_SHEET_FONT_SIZE + 4),
+                                        bold=True)
+    headers_fill = openpyxl.styles.fills.PatternFill(start_color="ddd9c3",
+                                                     end_color="ddd9c3",
+                                                     patternType="solid")
+    title_row_height = "20"
+    # Set the sheet title
+    sheet.title = _EXP_SHEET
+    # Write any header rows
+    title = "Overview of coordinated Earth system experiments for NorESM3"
+    set_cell(sheet, row, col, title, alignment=center_align, font=title_font,
+             height="28")
+    sheet.merge_cells(start_row=row, end_row=row,
+                      start_column=1, end_column=len(_EXPERIMENT_COLUMNS))
+    row += 1
+    title_row = row
+    for title in _COL_PREF_ORDER:
+        # Write the prefered columns first
+        set_cell(sheet, title_row, col, title, alignment=hcenter_align,
+                 fill=headers_fill, font=headers_font,
+                 width=_COLUMN_WIDTHS[title], height=title_row_height)
+        _EXPERIMENT_COLUMNS[title] = col
+        last_col = col
+        col += 1
+    # end for
+    for title in _EXPERIMENT_COLUMNS.keys():
+        # Now, write any leftover columns
+        if title not in _COL_PREF_ORDER:
+            set_cell(sheet, title_row, col, title, alignment=hcenter_align,
+                     fill=headers_fill, font=headers_font,
+                     width=_COLUMN_WIDTHS[title], height=title_row_height)
+            _EXPERIMENT_COLUMNS[title] = col
+            last_col = col
+            col += 1
+        # end if
+    # end for
+    return title_row, first_col, last_col
+
+def find_experiment_row(sheet):
+    """
+    For an existing spreadsheet, find the title row and the column number
+    for each experiment column.
+    Return the title row number, first column number and last column number.
+    """
+    # Find the title row
+    title_row = -1
+    first_col = -1
+    last_col = -1
+    row = 1
+    col = 1
+    title_keys = list(_EXPERIMENT_COLUMNS.keys())
+    while (title_row < 0) or (col > 1):
+        title = sheet.cell(row=row, column=col).value
+        if title:
+            if title in title_keys:
+                title_row = row
+                _EXPERIMENT_COLUMNS[title] = col
+                if first_col < 0:
+                    first_col = col
+                # end if
+                last_col = col
+            # end if
+            col += 1
+        else:
+            # Title rows are not allowed to have blank entries
+            row += 1
+            col = 1
+        # end if
+        if col > sheet.max_column:
+            row += 1
+            col = 1
+        # end if
+    # end while
+    if None in _EXPERIMENT_COLUMNS.values():
+        missing = ', '.join([x for x in _EXPERIMENT_COLUMNS.keys() if
+                             _EXPERIMENT_COLUMNS[x] is None])
+        raise ValueError(f"Columns missing from {_EXP_SHEET} sheet: {missing}")
+    # end if
+    return title_row, first_col, last_col
+
+def _main_func(args):
+    """
+    Parse the input arguments, download a GitHub repository's issues, and
+    update an issues spreadsheet.
+    """
+    repository, spreadsheet, overwrite = parse_command_line(args)
+    write_new_spreadsheet = True
+    exp_align = openpyxl.styles.Alignment(horizontal="left")
+    exp_font = openpyxl.styles.Font(size=str(_SHEET_FONT_SIZE), bold=False)
+    exp_fills = [openpyxl.styles.fills.PatternFill(start_color="ffffff",
+                                                   end_color="ffffff",
+                                                   patternType="solid"),
+                 openpyxl.styles.fills.PatternFill(start_color="dee6ef",
+                                                   end_color="dee6ef",
+                                                   patternType="solid")]
+
+
+    wb_file = os.path.realpath(spreadsheet)
+    if os.path.exists(wb_file) and (not overwrite):
+        write_new_spreadsheet = False
+        # Open and read the notebook
+        workbook = openpyxl.load_workbook(wb_file)
+        sheet_names = workbook.sheetnames
+        if _EXP_SHEET not in sheet_names:
+            raise ValueError(f"Sheet, {_EXP_SHEET} not found in {wb_file}.")
+        # end if
+        sheet = workbook[_EXP_SHEET]
+        title_row, first_col, last_col = find_experiment_row(sheet)
+        exp_font = sheet.cell(row=title_row+1, column=1).font
+    else:
+        workbook = openpyxl.Workbook()
+        # Should only be on worksheet. Be sure
+        while len(workbook.worksheets) > 1:
+            workbook.remove_sheet(workbook.sheetnames[-1])
+        # end while
+        sheet = workbook.worksheets[0]
+        title_row, first_col, last_col = initialize_experiment_sheet(sheet)
+        exp_font = openpyxl.styles.Font(size=str(_SHEET_FONT_SIZE), bold=False)
+    # end if
+
+    # Download the issues
+    repo_issues = download_github_issues(repository)
+
+    ## Parse the issues and fill out one row per issue
+    curr_row = title_row
+    fill_index = 0
+    for issue_num in sorted(repo_issues.keys()):
+        issue = repo_issues[issue_num]
+        # Find a row to write on
+        if write_new_spreadsheet:
+            curr_row += 1
+        else:
+            col = _EXPERIMENT_COLUMNS["Issue_id"]
+            curr_row = find_row(sheet, str(issue_num), min_row=title_row+1,
+                                min_col=col, max_col=col, blank_ok=True)
+            if not curr_row:
+                # Did not find row!
+                raise Exception(f"No row available to write issue {issue_num}")
+            # end if
+        # end if
+        for key in issue.keys():
+            col = _EXPERIMENT_COLUMNS[key]
+            if not col:
+                raise Exception(f"Internal ERROR: No column found for {key}")
+            # end if
+            set_cell(sheet, curr_row, col, issue[key], alignment=exp_align,
+                     fill=exp_fills[fill_index], font=exp_font)
+        # end for
+        fill_index = 1 - fill_index # Alternate rows
+    # end for
+    workbook.save(wb_file)
+    return 0
+
+###############################################################################
+
+if __name__ == "__main__":
+    ret = _main_func(sys.argv[1:])
+    sys.exit(ret)
