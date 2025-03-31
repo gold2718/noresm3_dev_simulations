@@ -143,14 +143,16 @@ def download_github_issues(repo_name, PAT=None, issues_path=None,
     Inspired by https://stackoverflow.com/questions/57211865/downloading-issues-from-a-public-github-repository#57213375
     """
     assert isinstance(repo_name, str), "repository name must be a string"
-    if not user:
-        user = input("Enter the username for this access request: ").strip()
+    if user:
         assert isinstance(user, str), f"username must be a string, not {type(user)}"
+    else:
+        user = input("Enter the username for this access request: ").strip()
     # end if
-    if not PAT:
-        PAT = get_password(f"Enter the access token for {repo_name}: ")
+    if PAT:
         assert isinstance(PAT, str), "access token must be a string"
-    # end if
+    elif user:
+        PAT = get_password(f"Enter the access token for {repo_name}: ")
+    # end if (if no user, just skip authentication)
     if protocol == "https":
         repo_url = f"https://{repo_site}/{org}/{repo_name}"
     elif protocol == "ssh":
@@ -158,8 +160,12 @@ def download_github_issues(repo_name, PAT=None, issues_path=None,
     else:
         raise ValueError(f"Invalid protocol ({protocol}), enter https or ssh")
     # end if
-    auth = github.Auth.Login(login=user, password=PAT)
-    gh_access = github.Github(auth=auth)
+    if user and PAT:
+        auth = github.Auth.Login(login=user, password=PAT)
+        gh_access = github.Github(auth=auth)
+    else:
+        gh_access = github.Github()
+    # end if
     gh_org = gh_access.get_organization(org)
     repo = gh_org.get_repo(repo_name)
     issue_dict = {}
@@ -176,6 +182,7 @@ def download_github_issues(repo_name, PAT=None, issues_path=None,
         if isinstance(issue._pull_request, github.GithubObject._NotSetType):
             title = issue.title
             number = issue.number
+            url = issue.html_url
             body = issue.body
             find_body_info(body, body_dict)
             user = issue.user.login
@@ -251,7 +258,7 @@ def download_github_issues(repo_name, PAT=None, issues_path=None,
 
             issue_dict[number] = {"Issue_id":number, "Compset":compset,
                                   "Resolution":grid, "Model tag":code_vers,
-                                  "Originator":user}
+                                  "Originator":user, "URL":url}
             issue_dict[number].update(body_dict)
         # end if
     # end for
@@ -286,9 +293,13 @@ def parse_command_line(args):
     pargs = parser.parse_args(args)
     return pargs.repository, pargs.spreadsheet, pargs.overwrite
 
-def _cell_str(row, col):
-    """Given a row and column, return a column designation"""
-    pass
+def col_name(col):
+    """Given a column number, return the corresponding column letter"""
+    return chr(ord('A') + col - 1)
+
+def cell_str(row, col):
+    """Given a row and column, return the corresponding cell designation"""
+    return f"{col_name(col)}{row}"
 
 def find_row(sheet, search_txt, min_row=None, min_col=None, max_col=None,
              blank_ok=True):
@@ -334,7 +345,7 @@ def find_row(sheet, search_txt, min_row=None, min_col=None, max_col=None,
     return search_row
 
 def set_cell(sheet, row, col, cell_text, alignment=None,
-             fill=None, font=None, width=None, height=None):
+             fill=None, font=None, width=None, height=None, url=None):
     """
     Fill out and format a cell.
     """
@@ -344,7 +355,17 @@ def set_cell(sheet, row, col, cell_text, alignment=None,
     side = openpyxl.styles.borders.Side(color=color, border_style="thin")
     border = openpyxl.styles.borders.Border(left=side, right=side,
                                             bottom=side, top=side)
-    cell.value = cell_text
+    if url:
+        hlink = openpyxl.worksheet.hyperlink.Hyperlink(location=url,
+                                                       ref=cell_str(row, col),
+                                                       display=str(cell_text))
+        hlink = f'=HYPERLINK("{url}", "{cell_text}")'
+#        cell.value = cell_text
+        cell.hyperlink = hlink
+        cell.style = "Hyperlink"
+    else:
+        cell.value = cell_text
+    # end if
     if alignment:
         cell.alignment = alignment
     # end if
@@ -355,8 +376,7 @@ def set_cell(sheet, row, col, cell_text, alignment=None,
         cell.fill = fill
     # end if
     if width:
-        col_name = chr(ord('A') + col - 1)
-        sheet.column_dimensions[col_name].width = width
+        sheet.column_dimensions[col_name(col)].width = width
     # end if
     if height:
         sheet.row_dimensions[row].height = height
@@ -521,12 +541,19 @@ def _main_func(args):
             # end if
         # end if
         for key in issue.keys():
-            col = _EXPERIMENT_COLUMNS[key]
-            if not col:
-                raise Exception(f"Internal ERROR: No column found for {key}")
+            if key != "URL": # Special key, not a cell column
+                col = _EXPERIMENT_COLUMNS[key]
+                if not col:
+                    raise Exception(f"Internal ERROR: No column found for {key}")
+                # end if
+                if key == "Issue_id":
+                    url = issue["URL"]
+                else:
+                    url = None
+                # end if
+                set_cell(sheet, curr_row, col, issue[key], alignment=exp_align,
+                         fill=exp_fills[fill_index], font=exp_font, url=url)
             # end if
-            set_cell(sheet, curr_row, col, issue[key], alignment=exp_align,
-                     fill=exp_fills[fill_index], font=exp_font)
         # end for
         fill_index = 1 - fill_index # Alternate rows
     # end for
